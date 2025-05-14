@@ -1,0 +1,631 @@
+provider "aws" {
+  alias  = "route53"
+  region = "us-east-1"
+  assume_role {
+    role_arn = "arn:aws:iam::818831340115:role/terraform_route53"
+  }
+}
+
+provider "aws" {
+  alias  = "tooling"
+  region = "us-east-1"
+  assume_role {
+    role_arn = "arn:aws:iam::295091084254:role/terraform_ecr"
+  }
+}
+
+locals {
+  env_names = toset(["backend", "frontend"])
+}
+
+module "alb" {
+  source  = "app.terraform.io/MetLifeLegalPlans/alb-module/aws"
+  version = "~> 2.0.0"
+
+  environment                         = local.environment
+  project                             = var.project
+  domain                              = local.domain
+  internal                            = local.internal
+  url                                 = local.url
+  health_check_path                   = var.health_check_path
+  django_admin                        = var.django_admin
+  alb_frontend_tg_unhealthy_threshold = var.alb_frontend_tg_unhealthy_threshold
+  alb_backend_tg_unhealthy_threshold  = var.alb_backend_tg_unhealthy_threshold
+  access_logs                         = var.access_logs
+  security_group_id                   = var.migrated ? aws_security_group.default[0].id : local.internal ? "sg-01ba1d61e97316db3" : "sg-0c8503a93303b7e23"
+  migrated                            = var.migrated
+}
+
+
+resource "aws_ecr_repository" "backend_tooling" {
+  count    = var.migrated ? 1 : 0
+  provider = aws.tooling
+  name     = "${var.project}-${local.backend}-${local.environment}"
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = {
+    Project   = var.project
+    Terraform = "true"
+  }
+}
+
+resource "aws_ecr_repository" "frontend_tooling" {
+  count    = var.migrated ? 1 : 0
+  provider = aws.tooling
+  name     = "${var.project}-${local.frontend}-${local.environment}"
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = {
+    Project   = var.project
+    Terraform = "true"
+  }
+}
+
+resource "aws_ecr_repository" "backend" {
+  count = var.migrated ? 0 : 1
+  name  = "${var.project}-${local.backend}-${var.environment}"
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = merge(local.common_tags)
+}
+
+resource "aws_ecr_repository" "frontend" {
+  count = var.migrated ? 0 : 1
+  name  = "${var.project}-${local.frontend}-${var.environment}"
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+  tags = merge(local.common_tags)
+}
+
+data "aws_iam_policy_document" "default" {
+  statement {
+    sid    = "AllowPullFromOrganization"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetAuthorizationToken",
+      "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart",
+      "ecr:CompleteLayerUpload",
+      "ecr:PutImage",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalOrgID"
+      values   = [local.org_id]
+    }
+  }
+}
+
+resource "aws_ecr_repository_policy" "backend" {
+  count      = var.migrated ? 1 : 0
+  provider   = aws.tooling
+  repository = aws_ecr_repository.backend_tooling[0].name
+  policy     = data.aws_iam_policy_document.default.json
+}
+
+resource "aws_ecr_repository_policy" "frontend" {
+  count      = var.migrated ? 1 : 0
+  provider   = aws.tooling
+  repository = aws_ecr_repository.frontend_tooling[0].name
+  policy     = data.aws_iam_policy_document.default.json
+}
+
+resource "aws_cloudwatch_log_group" "backend" {
+  name              = "/ecs/${var.project}-${local.backend}-${local.environment}"
+  retention_in_days = local.log_retention
+
+  tags = merge(local.common_tags)
+}
+
+resource "aws_cloudwatch_log_group" "services" {
+  for_each = var.backend_services
+
+  name              = "/ecs/${var.project}-${each.key}-${local.environment}"
+  retention_in_days = local.log_retention
+
+  tags = merge(local.common_tags)
+}
+
+resource "aws_cloudwatch_log_group" "frontend" {
+  name              = "/ecs/${var.project}-${local.frontend}-${local.environment}"
+  retention_in_days = local.log_retention
+
+  tags = merge(local.common_tags)
+}
+
+module "backend_task_def" {
+  source  = "mongodb/ecs-task-definition/aws"
+  version = "2.1.5"
+
+  family      = "${var.project}-${local.backend}-${local.environment}"
+  image       = var.migrated ? "${aws_ecr_repository.backend_tooling[0].repository_url}:latest" : "${aws_ecr_repository.backend[0].repository_url}:latest"
+  cpu         = var.cpu
+  memory      = var.memory
+  name        = local.backend
+  essential   = true
+  environment = var.backend_environment
+
+  execution_role_arn = var.migrated ? aws_iam_role.ecs_execution_role[0].arn : local.task_role_arn
+  task_role_arn      = var.migrated ? aws_iam_role.ecs_task_role[0].arn : local.task_role_arn
+
+  network_mode = "awsvpc"
+
+  requires_compatibilities = ["FARGATE"]
+  portMappings = [
+    {
+      containerPort = var.backend_port,
+      hostPort      = var.backend_port
+    },
+  ]
+
+  logConfiguration = {
+    logDriver = "awslogs",
+    options = {
+      "awslogs-group" : "/ecs/${var.project}-${local.backend}-${local.environment}",
+      "awslogs-region" : var.region,
+      "awslogs-stream-prefix" : "ecs"
+    }
+  }
+
+  tags = merge(local.common_tags)
+}
+
+module "service_task_defs" {
+  for_each = var.backend_services
+
+  source  = "mongodb/ecs-task-definition/aws"
+  version = "2.1.5"
+
+  family      = "${var.project}-${each.key}-${local.environment}"
+  image       = var.migrated ? "${aws_ecr_repository.backend_tooling[0].repository_url}:latest" : "${aws_ecr_repository.backend[0].repository_url}:latest"
+  cpu         = lookup(each.value, "cpu", var.cpu)
+  memory      = lookup(each.value, "memory", var.memory)
+  name        = each.key
+  essential   = true
+  environment = var.backend_environment
+  command     = each.value.command
+
+  execution_role_arn = var.migrated ? aws_iam_role.ecs_execution_role[0].arn : local.task_role_arn
+  task_role_arn      = var.migrated ? aws_iam_role.ecs_task_role[0].arn : local.task_role_arn
+
+  network_mode = "awsvpc"
+
+  requires_compatibilities = ["FARGATE"]
+
+  logConfiguration = {
+    logDriver = "awslogs",
+    options = {
+      "awslogs-group" : "/ecs/${var.project}-${each.key}-${local.environment}",
+      "awslogs-region" : var.region,
+      "awslogs-stream-prefix" : "ecs"
+    }
+  }
+
+  tags = merge(local.common_tags)
+}
+
+module "frontend_task_def" {
+  source  = "mongodb/ecs-task-definition/aws"
+  version = "2.1.5"
+
+  family      = "${var.project}-${local.frontend}-${local.environment}"
+  image       = var.migrated ? "${aws_ecr_repository.frontend_tooling[0].repository_url}:latest" : "${aws_ecr_repository.frontend[0].repository_url}:latest"
+  cpu         = var.cpu
+  memory      = var.memory
+  name        = local.frontend
+  essential   = true
+  environment = var.frontend_environment
+
+  execution_role_arn = var.migrated ? aws_iam_role.ecs_execution_role[0].arn : local.task_role_arn
+  task_role_arn      = var.migrated ? aws_iam_role.ecs_task_role[0].arn : local.task_role_arn
+
+  network_mode = "awsvpc"
+
+  requires_compatibilities = ["FARGATE"]
+  portMappings = [
+    {
+      containerPort = var.frontend_port,
+      hostPort      = var.frontend_port
+    },
+  ]
+
+  logConfiguration = {
+    logDriver = "awslogs",
+    options = {
+      "awslogs-group" : "/ecs/${var.project}-${local.frontend}-${local.environment}",
+      "awslogs-region" : var.region,
+      "awslogs-stream-prefix" : "ecs"
+    }
+  }
+
+  tags = merge(local.common_tags)
+}
+
+resource "aws_ecs_service" "frontend" {
+  name            = var.cluster_internal == true ? "${var.project}-${local.frontend}-${local.environment}" : "${var.project}-${local.frontend}"
+  cluster         = var.cluster_internal == true ? var.cluster : local.environment
+  task_definition = module.frontend_task_def.arn
+  desired_count   = var.desired_container_count
+  launch_type     = "FARGATE"
+
+  # Scale as we please without needing a hardcoded config change
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  load_balancer {
+    target_group_arn = module.alb.aws_alb_frontend_target_group_arn
+    container_name   = local.frontend
+    container_port   = var.frontend_port
+  }
+
+  enable_execute_command = true
+
+  network_configuration {
+    subnets          = data.aws_subnets.private_subnets.ids
+    security_groups  = [var.migrated ? aws_security_group.default[0].id : local.internal ? "sg-01ba1d61e97316db3" : "sg-0c8503a93303b7e23"]
+    assign_public_ip = false
+  }
+
+  tags = merge(local.common_tags)
+}
+
+resource "aws_ecs_service" "backend" {
+  name            = var.cluster_internal == true ? "${var.project}-${local.backend}-${local.environment}" : "${var.project}-${local.backend}"
+  cluster         = var.cluster_internal == true ? var.cluster : local.environment
+  task_definition = module.backend_task_def.arn
+  desired_count   = var.desired_container_count
+  launch_type     = "FARGATE"
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  load_balancer {
+    target_group_arn = module.alb.aws_alb_backend_target_group_arn
+    container_name   = local.backend
+    container_port   = var.backend_port
+  }
+
+  enable_execute_command = true
+
+  network_configuration {
+    subnets = data.aws_subnets.private_subnets.ids
+    security_groups = var.migrated ? [aws_security_group.default[0].id] : (
+      local.internal ? [
+        "sg-01ba1d61e97316db3", #vpn-facing-load-balancer
+        "sg-0efc83d28779e259c", #redis-sg
+        "sg-0d99d3e5c9eeb625b"  #rds-sg
+        ] : [
+        "sg-0c8503a93303b7e23", #internet-facing-load-balancer
+        "sg-0efc83d28779e259c", #redis-sg
+        "sg-0d99d3e5c9eeb625b"  #rds-sg
+      ]
+    )
+    assign_public_ip = false
+  }
+
+  tags = merge(local.common_tags)
+}
+
+resource "aws_ecs_service" "services" {
+  for_each = var.backend_services
+
+  name            = var.cluster_internal == true ? "${var.project}-${each.key}-${local.environment}" : "${var.project}-${each.key}"
+  cluster         = var.cluster_internal == true ? var.cluster : local.environment
+  task_definition = module.service_task_defs[each.key].arn
+  desired_count   = lookup(each.value, "desired_container_count", var.desired_container_count)
+  launch_type     = "FARGATE"
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  enable_execute_command = true
+
+  network_configuration {
+    subnets = data.aws_subnets.private_subnets.ids
+    security_groups = var.migrated ? [aws_security_group.default[0].id] : [
+      "sg-01ba1d61e97316db3", #vpn-facing-load-balancer
+      "sg-0efc83d28779e259c", #redis-sg
+      "sg-0d99d3e5c9eeb625b"  #rds-sg
+    ]
+
+    assign_public_ip = false
+  }
+
+  tags = merge(local.common_tags)
+}
+
+### ecs autoscaling policy
+resource "aws_appautoscaling_target" "ecs_target" {
+  for_each           = local.env_names
+  max_capacity       = var.max_capacity
+  min_capacity       = var.min_capacity
+  resource_id        = var.cluster_internal == true ? "service/internal/${var.project}-${each.value}-${local.environment}" : "service/${local.environment}/${var.project}-${each.value}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+  # adding the depends_on line eliminates an error during fresh terraform run
+  depends_on = [aws_ecs_service.frontend, aws_ecs_service.backend]
+}
+resource "aws_appautoscaling_policy" "memory_scaling_policy" {
+  for_each           = local.env_names
+  name               = "Above${var.memory_utilization}Mem"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target[each.value].resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target[each.value].scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target[each.value].service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageMemoryUtilization"
+    }
+
+    target_value = var.memory_utilization
+  }
+}
+
+resource "aws_appautoscaling_policy" "cpu_scaling_policy" {
+  for_each           = local.env_names
+  name               = "Above${var.cpu_utilization}CPU"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target[each.value].resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target[each.value].scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target[each.value].service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+
+    target_value = var.cpu_utilization
+  }
+}
+
+
+resource "aws_iam_role" "ecs_execution_role" {
+  count = var.migrated ? 1 : 0
+  name  = "${var.project}-${var.environment}-ecs-execution-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_attachment" {
+  count      = var.migrated ? 1 : 0
+  role       = aws_iam_role.ecs_execution_role[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role" "ecs_task_role" {
+  count = var.migrated ? 1 : 0
+  name  = "${var.project}-${var.environment}-ecs-task-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+# Attach policies to the ECS task role as needed
+resource "aws_iam_policy" "secrets" {
+  count = var.migrated ? 1 : 0
+  name  = "${var.project}-${var.environment}-secrets-readonly-policy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow",
+      Action = [
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:ListSecretVersionIds",
+        "secretsmanager:ListSecrets",
+        "secretsmanager:GetRandomPassword"
+      ],
+      Resource = ["arn:aws:secretsmanager:*:${data.aws_caller_identity.current.account_id}:secret:*"]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "secrets_manager_attachment" {
+  count      = var.migrated ? 1 : 0
+  role       = aws_iam_role.ecs_task_role[0].name
+  policy_arn = aws_iam_policy.secrets[0].arn
+}
+
+resource "aws_iam_policy" "s3" {
+  count = var.migrated ? 1 : 0
+  name  = "${var.project}-${var.environment}-s3-policy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow",
+      Action = [
+        "s3:*"
+      ],
+      Resource = [
+        "arn:aws:s3:::*${replace(var.project, "/s$/", "")}*",
+        "arn:aws:s3:::*${replace(var.project, "/s$/", "")}*/*",
+        "arn:aws:s3:::*${var.project}*",
+        "arn:aws:s3:::*${var.project}*/*"
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "s3" {
+  count      = var.migrated ? 1 : 0
+  role       = aws_iam_role.ecs_task_role[0].name
+  policy_arn = aws_iam_policy.s3[0].arn
+}
+
+resource "aws_iam_policy" "ssm_messages" {
+  count = var.migrated ? 1 : 0
+  name  = "${var.project}-${var.environment}-ssm-messages-policy"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ],
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_messages_attachment" {
+  count      = var.migrated ? 1 : 0
+  role       = aws_iam_role.ecs_task_role[0].name
+  policy_arn = aws_iam_policy.ssm_messages[0].arn
+}
+
+resource "aws_route53_record" "private_record" {
+  count    = local.is_prod ? 0 : 1
+  provider = aws.route53
+
+  zone_id = local.route53_zone_id
+  name    = "${local.url}.${local.domain}"
+  type    = "A"
+
+  alias {
+    name                   = module.alb.aws_alb_dns_name
+    zone_id                = module.alb.aws_alb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "public_record" {
+  count    = local.is_prod ? 1 : 0
+  provider = aws.route53
+
+  zone_id = local.route53_zone_id
+  name    = "${local.url}.${local.domain}"
+  type    = "A"
+
+  alias {
+    name                   = module.alb.aws_alb_dns_name
+    zone_id                = module.alb.aws_alb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_security_group" "default" {
+  count       = var.migrated ? 1 : 0
+  name        = "${var.project}-${var.environment}-sg"
+  description = "Security group allowing inbound traffic on ports 80, 443, Redis, and conditionally RDS"
+  vpc_id      = data.aws_vpc.default.id
+
+  # Inbound rules
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  dynamic "ingress" {
+    for_each = toset([var.frontend_port, var.backend_port])
+    content {
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = [data.aws_vpc.default.cidr_block]
+    }
+  }
+
+  # Redis ingress rule (always included)
+  ingress {
+    from_port   = 6379
+    to_port     = 6379
+    protocol    = "tcp"
+    cidr_blocks = [data.aws_vpc.default.cidr_block]
+  }
+
+  # RDS ingress rule (conditional)
+  dynamic "ingress" {
+    for_each = var.rds_enabled ? [1] : []
+    content {
+      from_port   = 5432
+      to_port     = 5432
+      protocol    = "tcp"
+      cidr_blocks = [data.aws_vpc.default.cidr_block]
+    }
+  }
+
+  # Outbound rules
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project}-${var.environment}-sg"
+  })
+}
+
+data "aws_wafv2_web_acl" "allow_from_us" {
+  count = var.environment == "staging" ? 1 : 0
+  name  = "Georestriction"
+  scope = "REGIONAL"
+}
+
+# Associate ALB with existing Web ACL
+resource "aws_wafv2_web_acl_association" "alb" {
+  count        = var.environment == "staging" ? 1 : 0
+  resource_arn = module.alb.aws_alb_arn
+  web_acl_arn  = data.aws_wafv2_web_acl.allow_from_us[0].arn
+}
+
+# Enable AWS Shield protection for the ALB
+resource "aws_shield_protection" "alb" {
+  count        = var.environment == "staging" ? 1 : 0
+  name         = "${var.project}-${var.environment}-alb-shield"
+  resource_arn = module.alb.aws_alb_arn
+}
