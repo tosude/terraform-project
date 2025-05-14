@@ -1,0 +1,272 @@
+provider "aws" {
+  alias  = "tooling"
+  region = "us-east-1"
+  assume_role {
+    role_arn = "arn:aws:iam::295091084254:role/terraform_ecr"
+  }
+}
+
+resource "aws_codepipeline" "codepipeline" {
+  count    = var.migrated ? 1 : 0
+  name     = local.name
+  role_arn = aws_iam_role.codepipeline_role[0].arn
+
+  artifact_store {
+    location = local.codepipeline_bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        ConnectionArn        = local.github_connection_arn
+        FullRepositoryId     = "MetLifeLegalPlans/${var.repo_name}"
+        BranchName           = var.branch_name
+        OutputArtifactFormat = "CODE_ZIP"
+      }
+      run_order = 1
+    }
+  }
+
+  stage {
+    name = "Build"
+
+    action {
+      name     = "BuildBackend"
+      category = "Build"
+      owner    = "AWS"
+      configuration = {
+        EnvironmentVariables = "[{\"name\":\"IMAGE_NAME\",\"value\":\"${var.project}-backend-${var.environment}\",\"type\":\"PLAINTEXT\"},{\"name\":\"ENVIRONMENT_TAG\",\"value\":\"latest\",\"type\":\"PLAINTEXT\"},{\"name\":\"BUILD_ARGS\",\"value\":\"DT_API_TOKEN=dt0c01.TNBREIG5QYOOW3UEZU2YU232.N7VTMIM3R2TLELJAOIAN4F272QT5RYZOW4CVGMVOEWIVHDF4URJBYHUHVTEPQD4K\",\"type\":\"PLAINTEXT\"}]"
+        ProjectName          = aws_codebuild_project.build-backend[0].id
+      }
+      input_artifacts = [
+        "source_output"
+      ]
+      provider = "CodeBuild"
+      version  = "1"
+      output_artifacts = [
+        "backend_build_output"
+      ]
+      run_order = 1
+    }
+    action {
+      name     = "BuildFrontend"
+      category = "Build"
+      owner    = "AWS"
+      configuration = {
+        EnvironmentVariables = "[{\"name\":\"IMAGE_NAME\",\"value\":\"${var.project}-frontend-${var.environment}\",\"type\":\"PLAINTEXT\"},{\"name\":\"ENVIRONMENT_TAG\",\"value\":\"latest\",\"type\":\"PLAINTEXT\"}]"
+        ProjectName          = aws_codebuild_project.build-frontend[0].id
+      }
+      input_artifacts = [
+        "source_output"
+      ]
+      provider = "CodeBuild"
+      version  = "1"
+      output_artifacts = [
+        "frontend_build_output"
+      ]
+      run_order = 1
+    }
+  }
+
+  stage {
+    name = "Deploy"
+
+    action {
+      name     = "DeployBackend"
+      category = "Deploy"
+      owner    = "AWS"
+      configuration = {
+        ClusterName = var.cluster_name
+        FileName    = "backendimagedefinitions.json"
+        ServiceName = "${var.project}-backend"
+      }
+      input_artifacts = [
+        "backend_build_output"
+      ]
+      provider  = "ECS"
+      version   = "1"
+      run_order = 1
+    }
+    action {
+      name     = "DeployFrontend"
+      category = "Deploy"
+      owner    = "AWS"
+      configuration = {
+        ClusterName = var.cluster_name
+        FileName    = "imagedefinitions.json"
+        ServiceName = "${var.project}-frontend"
+      }
+      input_artifacts = [
+        "frontend_build_output"
+      ]
+      provider  = "ECS"
+      version   = "1"
+      run_order = 1
+    }
+    dynamic "action" {
+      for_each = var.has_worker ? [1] : []
+      content {
+        name     = "DeployWorker"
+        category = "Deploy"
+        owner    = "AWS"
+        configuration = {
+          ClusterName = var.cluster_name
+          FileName    = "workerimagedefinitions.json"
+          ServiceName = "${var.project}-worker"
+        }
+        input_artifacts = [
+          "backend_build_output"
+        ]
+        provider  = "ECS"
+        version   = "1"
+        run_order = 1
+      }
+    }
+    dynamic "action" {
+      for_each = var.has_scheduler ? [1] : []
+      content {
+        name     = "DeployScheduler"
+        category = "Deploy"
+        owner    = "AWS"
+        configuration = {
+          ClusterName = var.cluster_name
+          FileName    = "schedulerimagedefinitions.json"
+          ServiceName = "${var.project}-scheduler"
+        }
+        input_artifacts = [
+          "backend_build_output"
+        ]
+        provider  = "ECS"
+        version   = "1"
+        run_order = 1
+      }
+    }
+  }
+}
+
+data "aws_iam_policy_document" "assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["codepipeline.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["codebuild.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "codepipeline_role" {
+  count              = var.migrated ? 1 : 0
+  name               = "${local.name}-cp-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+data "aws_iam_policy_document" "codepipeline_policy" {
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:GetBucketVersioning",
+      "s3:PutObjectAcl",
+      "s3:PutObject",
+    ]
+
+    resources = [
+      local.codepipeline_bucket_arn,
+      "${local.codepipeline_bucket_arn}/*"
+    ]
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["codestar-connections:UseConnection"]
+    resources = [local.github_connection_arn]
+  }
+
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "codebuild:BatchGetBuilds",
+      "codebuild:StartBuild",
+    ]
+
+    resources = ["*"]
+  }
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+      "ecr:GetAuthorizationToken",
+      "ecr:*",
+    ]
+
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "codepipeline_policy" {
+  count  = var.migrated ? 1 : 0
+  name   = "${local.name}-cp-policy"
+  role   = aws_iam_role.codepipeline_role[0].id
+  policy = data.aws_iam_policy_document.codepipeline_policy.json
+}
+
+resource "aws_iam_role_policy_attachment" "attach" {
+  count      = var.migrated ? 1 : 0
+  role       = aws_iam_role.codepipeline_role[0].id
+  policy_arn = "arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "attach_ecs" {
+  count      = var.migrated ? 1 : 0
+  role       = aws_iam_role.codepipeline_role[0].id
+  policy_arn = "arn:aws:iam::aws:policy/AmazonECS_FullAccess"
+}
+
+variable "project" {}
+
+variable "environment" {}
+
+variable "repo_name" {}
+
+variable "branch_name" {}
+
+variable "cluster_name" {}
+
+variable "has_worker" {
+  default = false
+}
+
+variable "has_scheduler" {
+  default = false
+}
+
+variable "migrated" {}
