@@ -1,0 +1,192 @@
+locals {
+
+  all_subnet_cidrs = substr(var.vpc_cidr, -2, 2) == "20" ? cidrsubnets(var.vpc_cidr, 2, 2, 2, 4, 4, 4, 6, 6, 6) : substr(var.vpc_cidr, -2, 2) == "19" ? cidrsubnets(var.vpc_cidr, 2, 2, 2, 4, 4, 4, 6, 6, 6) : []
+  compute          = slice(local.all_subnet_cidrs, 0, 3)
+  data             = slice(local.all_subnet_cidrs, 3, 6)
+  external         = (var.region == "us-west-1" || var.region == "us-west-2") ? slice(local.all_subnet_cidrs, 6, 8) : slice(local.all_subnet_cidrs, 6, 9)
+
+  tags = {
+    Environment = var.environment
+    Owner       = var.owner
+  }
+  az_count = length(data.aws_availability_zones.available.names)
+  azs      = local.az_count == 2 ? slice(data.aws_availability_zones.available.names, 0, 2) : slice(data.aws_availability_zones.available.names, 0, 3)
+
+  az_names = slice(data.aws_availability_zones.available.names, 0, length(module.vpc.private_route_table_ids))
+
+  private_route_table_id_map = zipmap(
+    local.az_names,
+    module.vpc.private_route_table_ids
+  )
+
+  routing_type = (contains(["dev", "qa", "staging", "sandbox-equinix", "feature"], lower(var.environment)) ? "nonprod" :
+    contains(["Prod", "production", "shared"], lower(var.environment)) ? "prod" :
+  "unknown")
+
+}
+
+### VPC MODULE ###
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+
+  name = var.vpc_name
+  cidr = var.vpc_cidr
+
+  # How many AZ
+  azs              = local.azs
+  private_subnets  = local.compute
+  database_subnets = local.data
+  public_subnets   = local.external
+
+  # Additional tags for subnets
+
+  public_subnet_tags = {
+    Type      = "External"
+    Placement = "public"
+  }
+  private_subnet_tags = {
+    Type      = "Compute"
+    Placement = "private"
+  }
+  database_subnet_tags = {
+    Type = "Data"
+  }
+
+  tags = {
+    Terraform   = "True"
+    Environment = var.environment
+    Owner       = var.owner
+  }
+
+  public_dedicated_network_acl       = true
+  private_dedicated_network_acl      = true
+  database_dedicated_network_acl     = true
+  create_database_subnet_route_table = true
+  enable_dns_hostnames               = true
+  enable_dns_support                 = true
+  private_subnet_suffix              = "compute"
+  public_subnet_suffix               = "external"
+  database_subnet_suffix             = "data"
+  manage_default_security_group      = true
+
+  enable_nat_gateway  = true
+  single_nat_gateway  = false
+  reuse_nat_ips       = true # <= Skip creation of EIPs for the NAT Gateways
+  external_nat_ip_ids = aws_eip.nat.*.id
+
+}
+
+resource "aws_eip" "nat" {
+  count = 3
+
+  domain = "vpc"
+}
+
+### VPC ENDPOINTS ###
+module "vpc_endpoints" {
+  source = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
+
+  vpc_id             = module.vpc.vpc_id
+  security_group_ids = [module.vpc.default_vpc_default_security_group_id]
+
+
+  endpoints = {
+    s3 = {
+      service         = "s3"
+      service_type    = "Gateway"
+      route_table_ids = flatten([module.vpc.private_route_table_ids, module.vpc.public_route_table_ids, module.vpc.database_route_table_ids])
+      tags            = { Name = "s3-vpc-endpoint" }
+    }
+  }
+}
+
+### AUTO VPC ATTACHEMENT TO mlp-network default RT ###
+resource "aws_ec2_transit_gateway_vpc_attachment" "vpc_attach_tgw" {
+  count              = var.region == "us-east-1" ? 1 : 0
+  transit_gateway_id = data.aws_ec2_transit_gateway.this[0].id
+  vpc_id             = module.vpc.vpc_id
+  subnet_ids         = module.vpc.private_subnets
+  # Set the dependency on the VPC module
+  depends_on = [module.vpc]
+  tags = {
+    Terraform   = "True"
+    Environment = var.environment
+    Name        = "vpc-attachment-for-${var.vpc_name}"
+  }
+}
+
+resource "aws_ec2_transit_gateway_vpc_attachment" "mlp-vpc-tgw-attachement" {
+  count              = var.region == "us-east-1" ? 1 : 0
+  transit_gateway_id = data.aws_ec2_transit_gateway.mlp-network-tgw-use1[0].id
+  vpc_id             = module.vpc.vpc_id
+  subnet_ids         = module.vpc.private_subnets
+  depends_on         = [module.vpc]
+  tags = {
+    Terraform   = "True"
+    Environment = var.environment
+    Type        = "VPC-TGW-attachement"
+    Region      = var.region
+    Name        = "vpc-tgw-attachment-for-${var.vpc_name}-${var.routing_type}"
+  }
+}
+
+### Supporting DATA ###
+data "aws_ec2_transit_gateway" "this" {
+  count = var.region == "us-east-1" ? 1 : 0
+  id    = "tgw-0567578feefbad637"
+}
+
+### Supporting data for Networking Account TGW ###
+data "aws_ec2_transit_gateway" "mlp-network-tgw-use1" {
+  count = var.region == "us-east-1" ? 1 : 0
+  id    = "tgw-0e834b5b35397c16c"
+}
+
+### VPC Routes from compute RTs to Networking TGW(new) ###
+resource "aws_route" "mlp_tgw_routes_to_rt" {
+  for_each = local.private_route_table_id_map
+
+  route_table_id         = each.value
+  destination_cidr_block = "10.0.0.0/8"
+  transit_gateway_id     = data.aws_ec2_transit_gateway.mlp-network-tgw-use1[0].id
+
+  depends_on = [aws_ec2_transit_gateway_vpc_attachment.mlp-vpc-tgw-attachement]
+
+  lifecycle {
+    ignore_changes = [
+      route_table_id,
+      destination_cidr_block
+    ]
+  }
+}
+
+
+variable "environment" {
+  description = "The logical environment where this is being deployed."
+  type        = string
+}
+
+variable "owner" {
+  description = "The team name of the resource (Ex. 'DevOps')"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "cidr block for VPC"
+  type        = string
+}
+
+variable "vpc_name" {
+  description = "The Name of the VPC resource"
+  type        = string
+}
+
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "routing_type" {
+  type        = string
+  description = "Used for route table association: prod, nonprod, shared"
+}
