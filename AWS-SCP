@@ -1,0 +1,29 @@
+resource "aws_organizations_policy" "service_control_policy" {
+  name        = var.policy_name
+  content     = var.content
+}
+
+resource "aws_organizations_policy_attachment" "service_control_policy" {
+  policy_id = aws_organizations_policy.service_control_policy.id
+  target_id = var.target_id
+}
+
+variable "policy_name" {
+  type        = string
+  description = "Service control policy name"
+}
+
+variable "target_id" {
+  type        = string
+  description = "The unique identifier (ID) of the organization root, organizational unit, or account number that you want to attach the policy to"
+  default     = "r-pg1b"
+}
+
+variable "content" {
+  type        = string
+}
+
+output "organizations_policy_id" {
+  value       = aws_organizations_policy.service_control_policy.id
+  description = "The unique identifier of the policy"
+}
